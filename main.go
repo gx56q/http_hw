@@ -15,8 +15,54 @@ import (
 	"time"
 )
 
-var githubToken string
-var organization string
+const (
+	API        = "https://api.github.com/graphql"
+	TopAuthors = 100
+	MaxThreads = 15
+	ConfigFile = "config.txt"
+)
+
+type Config struct {
+	Token        string
+	Organization string
+}
+
+var config Config
+
+type RateLimiter struct {
+	mutex     sync.Mutex
+	cond      *sync.Cond
+	rateLimit bool
+}
+
+func NewRateLimiter() *RateLimiter {
+	rl := &RateLimiter{}
+	rl.cond = sync.NewCond(&rl.mutex)
+	return rl
+}
+
+func (rl *RateLimiter) Wait() {
+	rl.mutex.Lock()
+	for rl.rateLimit {
+		rl.cond.Wait()
+	}
+	rl.mutex.Unlock()
+}
+
+func (rl *RateLimiter) SetRateLimited() {
+	rl.mutex.Lock()
+	rl.rateLimit = true
+	rl.mutex.Unlock()
+}
+
+func (rl *RateLimiter) ClearRateLimited() {
+	rl.mutex.Lock()
+	rl.rateLimit = false
+	rl.cond.Broadcast()
+	rl.mutex.Unlock()
+}
+
+var rateLimiter = NewRateLimiter()
 
 type Commit struct {
 	Author struct {
@@ -29,29 +75,32 @@ type Repository struct {
 	Name string `json:"name"`
 }
 
-var (
-	rateLimitMutex sync.Mutex
-	rateLimitCond  = sync.NewCond(&rateLimitMutex)
-	rateLimited    = false
-)
+type Author struct {
+	Email   string
+	Commits int
+}
+
+type GraphQLRequest struct {
+	Query string `json:"query"`
+}
 
 func main() {
 	loadConfig()
 	client := http.Client{Timeout: time.Second * 30}
 
 	fmt.Println("Getting the list of organization repositories...")
-	repositories, err := getRepositories(client, organization)
+	repositories, err := getRepositories(client, config.Organization)
 	if err != nil {
 		fmt.Println("Error getting the list of repositories:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Found %d repositories in the organization %s\n", len(repositories), organization)
+	fmt.Printf("Found %d repositories in the organization %s\n", len(repositories), config.Organization)
 
 	fmt.Println("Getting the list of active authors...")
 	authors := make(map[string]int)
 	mux := &sync.Mutex{}
 	wg := &sync.WaitGroup{}
-	sem := make(chan bool, 15)
+	sem := make(chan bool, MaxThreads)
 
 	totalRepos := len(repositories)
 	processedRepos := 0
@@ -63,7 +112,7 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			commits, err := getCommits(client, organization, r.Name)
+			commits, err := getCommits(client, config.Organization, r.Name)
 			if err != nil {
 				fmt.Printf("Error getting commits for repository %s: %v\n", r.Name, err)
 				return
@@ -85,15 +134,15 @@ func main() {
 
 	fmt.Println("Sorting authors by activity...")
 	sortedAuthors := sortAuthors(authors)
-	fmt.Println("Top 100 most active authors in the organization", organization, "on GitHub:")
-	limit := 100
-	if len(sortedAuthors) < limit {
+	fmt.Println("Top", TopAuthors, "most active authors in the organization", config.Organization, "on GitHub:")
+	limit := TopAuthors
+	if len(sortedAuthors) < TopAuthors {
 		limit = len(sortedAuthors)
 	}
 	for i, author := range sortedAuthors[:limit] {
 		fmt.Printf("%d. %s: %d\n", i+1, author.Email, author.Commits)
 	}
-	err = writeAuthorsToFile(organization, len(repositories), sortedAuthors)
+	err = writeAuthorsToFile(config.Organization, len(repositories), sortedAuthors)
 	if err != nil {
 		fmt.Println("Error writing authors to file:", err)
 		os.Exit(1)
@@ -107,27 +156,18 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.github.com/graphql", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequest("POST", API, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "bearer "+githubToken)
+	req.Header.Set("Authorization", "bearer "+config.Token)
 
-	rateLimitMutex.Lock()
-	for rateLimited {
-		rateLimitCond.Wait()
-	}
-	rateLimitMutex.Unlock()
+	rateLimiter.Wait()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Println("Error closing response body:", err)
-		}
-	}(resp.Body)
+	defer safeClose(resp.Body, "HTTP response body")
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -135,9 +175,7 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 	}
 
 	if resp.StatusCode == 403 {
-		rateLimitMutex.Lock()
-		rateLimited = true
-		rateLimitMutex.Unlock()
+		rateLimiter.SetRateLimited()
 		bodyString := string(bodyBytes)
 		if strings.Contains(bodyString, "secondary rate limit") {
 			fmt.Println("Secondary rate limit reached for request. Waiting...")
@@ -149,11 +187,7 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 					fmt.Printf("Waiting for %d seconds until the limit resets at %s...\n", delay, exactResetTime.Format("15:04:05"))
 					time.Sleep(time.Duration(delay) * time.Second)
 					fmt.Println("Retrying request...")
-					rateLimitMutex.Lock()
-					rateLimited = false
-					rateLimitCond.Broadcast()
-					rateLimitMutex.Unlock()
-
+					rateLimiter.ClearRateLimited()
 					return doRequest(client, query)
 				}
 			} else {
@@ -161,11 +195,7 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 				fmt.Printf("Waiting for 1 minute until the limit resets at %s...\n", exactResetTime.Format("15:04:05"))
 				time.Sleep(1 * time.Minute)
 				fmt.Println("Retrying request...")
-				rateLimitMutex.Lock()
-				rateLimited = false
-				rateLimitCond.Broadcast()
-				rateLimitMutex.Unlock()
-
+				rateLimiter.ClearRateLimited()
 				return doRequest(client, query)
 			}
 		}
@@ -227,10 +257,6 @@ func getRepositories(client http.Client, org string) ([]Repository, error) {
 	return allRepos, nil
 }
 
-type GraphQLRequest struct {
-	Query string `json:"query"`
-}
-
 func fetchRepositories(client http.Client, query string) ([]Repository, bool, string, error) {
 	bodyBytes, err := doRequest(client, query)
 	if err != nil {
@@ -288,19 +314,14 @@ func getDefaultBranch(client http.Client, org, repo string) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.github.com/graphql", bytes.NewBuffer(reqBody))
-	req.Header.Set("Authorization", "bearer "+githubToken)
+	req, err := http.NewRequest("POST", API, bytes.NewBuffer(reqBody))
+	req.Header.Set("Authorization", "bearer "+config.Token)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Println("Error closing response body:", err)
-		}
-	}(resp.Body)
+	defer safeClose(resp.Body, "HTTP response body")
 
 	var response struct {
 		Data struct {
@@ -403,11 +424,6 @@ func fetchCommits(client http.Client, query string) ([]Commit, bool, string, err
 	return response.Data.Repository.Ref.Target.History.Nodes, response.Data.Repository.Ref.Target.History.PageInfo.HasNextPage, response.Data.Repository.Ref.Target.History.PageInfo.EndCursor, nil
 }
 
-type Author struct {
-	Email   string
-	Commits int
-}
-
 func sortAuthors(authors map[string]int) []Author {
 	sortedAuthors := make([]Author, 0, len(authors))
 	for email, commits := range authors {
@@ -426,14 +442,14 @@ func writeAuthorsToFile(org string, numOfRepos int, sortedAuthors []Author) erro
 	if err != nil {
 		return err
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			fmt.Println("Error closing file:", err)
-		}
-	}(file)
+	defer safeClose(file, "file")
 
-	for i, author := range sortedAuthors[:100] {
+	limit := TopAuthors
+	if len(sortedAuthors) < TopAuthors {
+		limit = len(sortedAuthors)
+	}
+
+	for i, author := range sortedAuthors[:limit] {
 		line := fmt.Sprintf("%d. %s: %d\n", i+1, author.Email, author.Commits)
 		_, err := file.WriteString(line)
 		if err != nil {
@@ -444,28 +460,27 @@ func writeAuthorsToFile(org string, numOfRepos int, sortedAuthors []Author) erro
 }
 
 func loadConfig() {
-	file, err := os.Open("config.txt")
+	file, err := os.Open(ConfigFile)
 	if err != nil {
 		panic("Failed to open the configuration file: " + err.Error())
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			panic("Failed to close the configuration file: " + err.Error())
-		}
-	}(file)
+	defer safeClose(file, "file")
 
 	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if githubToken == "" {
-			githubToken = scanner.Text()
-		} else {
-			organization = scanner.Text()
-			break
-		}
+	if scanner.Scan() {
+		config.Token = scanner.Text()
+	}
+	if scanner.Scan() {
+		config.Organization = scanner.Text()
 	}
 
 	if err := scanner.Err(); err != nil {
 		panic("Error reading the configuration file: " + err.Error())
+	}
+}
+
+func safeClose(c io.Closer, resourceDescription string) {
+	if err := c.Close(); err != nil {
+		fmt.Printf("Failed to close %s: %v\n", resourceDescription, err)
 	}
 }
