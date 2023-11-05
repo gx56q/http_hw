@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -85,7 +86,10 @@ type GraphQLRequest struct {
 }
 
 func main() {
-	loadConfig()
+	err := loadConfig()
+	if err != nil {
+		return
+	}
 	client := http.Client{Timeout: time.Second * 30}
 
 	fmt.Println("Getting the list of organization repositories...")
@@ -204,6 +208,7 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 
 	remaining := resp.Header.Get("X-RateLimit-Remaining")
 	if remaining == "0" {
+		rateLimiter.SetRateLimited()
 		resetTime := resp.Header.Get("X-RateLimit-Reset")
 		resetTimestamp, err := strconv.ParseInt(resetTime, 10, 64)
 		if err == nil {
@@ -211,6 +216,7 @@ func doRequest(client http.Client, query string) ([]byte, error) {
 			exactResetTime := time.Now().Add(resetTimeDuration)
 			fmt.Printf("Reached the rate limit. Waiting %v until the limit resets at %s...\n", resetTimeDuration, exactResetTime.Format("15:04:05"))
 			time.Sleep(resetTimeDuration)
+			rateLimiter.ClearRateLimited()
 			return doRequest(client, query)
 		}
 		return nil, fmt.Errorf("reached GitHub API rate limit")
@@ -459,24 +465,48 @@ func writeAuthorsToFile(org string, numOfRepos int, sortedAuthors []Author) erro
 	return nil
 }
 
-func loadConfig() {
+func loadConfig() error {
 	file, err := os.Open(ConfigFile)
 	if err != nil {
-		panic("Failed to open the configuration file: " + err.Error())
+		return errors.New("Failed to open the configuration file: " + err.Error())
 	}
 	defer safeClose(file, "file")
 
 	scanner := bufio.NewScanner(file)
-	if scanner.Scan() {
-		config.Token = scanner.Text()
-	}
-	if scanner.Scan() {
-		config.Organization = scanner.Text()
+	tokenFound := false
+	orgFound := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch key {
+		case "github_token":
+			if value != "" {
+				config.Token = value
+				tokenFound = true
+			}
+		case "organization":
+			if value != "" {
+				config.Organization = value
+				orgFound = true
+			}
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		panic("Error reading the configuration file: " + err.Error())
+		return errors.New("Error reading the configuration file: " + err.Error())
 	}
+
+	if !tokenFound || !orgFound {
+		return errors.New("missing or empty required configuration values. Please check your configuration file")
+	}
+	return nil
 }
 
 func safeClose(c io.Closer, resourceDescription string) {

@@ -1,2 +1,2 @@
-github_token
-organisation
+github_token=<token>
+organization=<organisation>
